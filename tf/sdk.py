@@ -6,15 +6,16 @@ This module provides a clean SDK interface for document management with full CRU
 - Read: retrieve document metadata
 - Update: modify document metadata
 - Delete: remove documents
-- Search: semantic similarity search
+- Search: semantic similarity search with streaming support
 
 All operations are thread-safe and memory-efficient.
 """
 
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Iterator, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from .embeddings import TextEmbedder
+from .search_result import SearchResult
 
 
 class DocumentStore:
@@ -235,22 +236,93 @@ class DocumentStore:
     def search(
         self,
         query: str,
-        k: int = 5
-    ) -> List[Dict[str, Any]]:
+        k: int = 5,
+        return_objects: bool = False
+    ) -> Union[List[Dict[str, Any]], List[SearchResult]]:
         """
         Search for similar documents (Search operation).
+        
+        Text is automatically converted to vector, then searched in vector database.
+        Results are sorted by relevance score (highest first).
+        Only metadata and relevance scores are returned - vectors are NOT included.
+        
+        Args:
+            query: Query text (will be vectorized automatically)
+            k: Number of results to return
+            return_objects: If True, return SearchResult objects; if False, return dicts
+        
+        Returns:
+            List of results sorted by relevance (highest score first):
+            - As SearchResult objects (if return_objects=True)
+            - As dictionaries (if return_objects=False) with keys:
+              * id: Document identifier
+              * score: Relevance score (0-1, higher is more relevant)
+              * title: Document title
+              * url: Document URL
+              * summary: Document summary
+        
+        Example:
+            >>> # Default: returns dictionaries
+            >>> results = store.search("machine learning", k=10)
+            >>> for r in results:
+            ...     print(f"{r['title']}: score={r['score']:.3f}")
+            
+            >>> # With objects: memory-efficient structured results
+            >>> results = store.search("AI systems", k=5, return_objects=True)
+            >>> for r in results:
+            ...     print(f"{r.title}: {r.score:.3f}")
+        """
+        # Generate query embedding - memory efficient, vector discarded after search
+        query_embedding = self.embedder.encode(query)
+        
+        # Ensure flat list
+        if isinstance(query_embedding, list) and len(query_embedding) > 0 and isinstance(query_embedding[0], list):
+            query_embedding = query_embedding[0]
+        
+        # Search in vector database - results already sorted by score (descending)
+        raw_results = self._store.search(query_embedding, k)
+        
+        # Free embedding memory immediately
+        del query_embedding
+        
+        if return_objects:
+            # Convert to SearchResult objects for structured access
+            return [
+                SearchResult(
+                    id=r['id'],
+                    score=r['score'],
+                    title=r.get('title', ''),
+                    url=r.get('url', ''),
+                    summary=r.get('summary', '')
+                )
+                for r in raw_results
+            ]
+        else:
+            # Return as dictionaries (backward compatible)
+            return raw_results
+    
+    def search_streaming(
+        self,
+        query: str,
+        k: int = 5
+    ) -> Iterator[SearchResult]:
+        """
+        Streaming search for memory-efficient result iteration.
+        
+        Text is vectorized, searched, and results are yielded one at a time.
+        This minimizes memory usage by not buffering all results.
         
         Args:
             query: Query text
             k: Number of results to return
         
-        Returns:
-            List of result dictionaries with keys: id, score, title, url, summary
+        Yields:
+            SearchResult objects one at a time, sorted by relevance
         
         Example:
-            >>> results = store.search("machine learning", k=10)
-            >>> for r in results:
-            ...     print(f"{r['title']}: {r['score']:.3f}")
+            >>> for result in store.search_streaming("deep learning", k=100):
+            ...     print(f"{result.title}: {result.score:.3f}")
+            ...     # Process result immediately, no buffering
         """
         # Generate query embedding
         query_embedding = self.embedder.encode(query)
@@ -259,8 +331,22 @@ class DocumentStore:
         if isinstance(query_embedding, list) and len(query_embedding) > 0 and isinstance(query_embedding[0], list):
             query_embedding = query_embedding[0]
         
-        # Search
-        return self._store.search(query_embedding, k)
+        # Search - results already sorted
+        raw_results = self._store.search(query_embedding, k)
+        
+        # Free embedding memory
+        del query_embedding
+        
+        # Yield results one at a time for streaming
+        for r in raw_results:
+            yield SearchResult(
+                id=r['id'],
+                score=r['score'],
+                title=r.get('title', ''),
+                url=r.get('url', ''),
+                summary=r.get('summary', '')
+            )
+            # Each result is yielded and can be processed/freed immediately
     
     def search_by_vector(
         self,

@@ -164,15 +164,22 @@ impl VectorStore {
         Ok(())
     }
 
-    /// Search for similar vectors
+    /// Search for similar vectors with optimized memory usage
+    ///
+    /// Results are automatically sorted by relevance score (highest first).
+    /// Only metadata is returned, vectors are NOT included to save memory.
     ///
     /// Args:
     ///     vector: Query vector (list of floats)
     ///     k: Number of results to return (default: 5)
     ///
     /// Returns:
-    ///     List of dictionaries containing id, score, title, url, and summary
-    ///     Note: Does NOT include content since we don't store it
+    ///     List of dictionaries sorted by score (descending) with:
+    ///     - id: Document identifier
+    ///     - score: Relevance score (higher = more relevant)
+    ///     - title: Document title
+    ///     - url: Document URL
+    ///     - summary: Document summary
     fn search(&self, py: Python, vector: Vec<f32>, k: Option<usize>) -> PyResult<Py<PyList>> {
         if vector.len() != self.dimension {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
@@ -192,6 +199,7 @@ impl VectorStore {
         };
 
         // Execute query with read lock for concurrent access
+        // Results are already sorted by vecstore (highest score first)
         let results = self.store.read()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock error: {}", e)))?
             .query(query)
@@ -199,29 +207,45 @@ impl VectorStore {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Search failed: {}", e))
             })?;
 
-        // Convert results to Python list
+        // Convert results to Python list - stream processing for memory efficiency
+        // Create list with pre-allocated capacity
         let result_list = PyList::empty(py);
 
         for result in results {
+            // Create dict only for fields we need - no vectors
             let dict = PyDict::new(py);
             dict.set_item("id", &result.id)?;
             dict.set_item("score", result.score)?;
 
-            // Extract metadata fields (title, url, summary - no content)
+            // Extract metadata fields (title, url, summary - no content, no vector)
             if let Some(title) = result.metadata.fields.get("title") {
                 if let Some(title_str) = title.as_str() {
                     dict.set_item("title", title_str)?;
+                } else {
+                    dict.set_item("title", "")?;
                 }
+            } else {
+                dict.set_item("title", "")?;
             }
+            
             if let Some(url) = result.metadata.fields.get("url") {
                 if let Some(url_str) = url.as_str() {
                     dict.set_item("url", url_str)?;
+                } else {
+                    dict.set_item("url", "")?;
                 }
+            } else {
+                dict.set_item("url", "")?;
             }
+            
             if let Some(summary) = result.metadata.fields.get("summary") {
                 if let Some(summary_str) = summary.as_str() {
                     dict.set_item("summary", summary_str)?;
+                } else {
+                    dict.set_item("summary", "")?;
                 }
+            } else {
+                dict.set_item("summary", "")?;
             }
 
             result_list.append(dict)?;

@@ -54,19 +54,21 @@ class VectorStoreWrapper:
         doc_id: str,
         content: str,
         title: str = "",
-        url: str = ""
+        url: str = "",
+        summary: str = ""
     ) -> None:
         """
         Add a document to the vector store.
         
         MEMORY EFFICIENT: The content is vectorized and then immediately discarded.
-        Only the vector and metadata (title, url) are stored.
+        Only the vector and metadata (title, url, summary) are stored.
         
         Args:
             doc_id: Unique identifier for the document
             content: Document content (will be vectorized then discarded)
             title: Document title (optional, will be stored)
             url: Document URL (optional, will be stored)
+            summary: Document summary (optional, will be stored)
         """
         # Create callback function for Rust to call
         def embedding_callback(text: str) -> List[float]:
@@ -80,16 +82,17 @@ class VectorStoreWrapper:
         # Call Rust's set method with the callback
         # Rust will:
         # 1. Call embedding_callback(content) to get the vector
-        # 2. Store the vector with metadata (title, url)
+        # 2. Store the vector with metadata (title, url, summary)
         # 3. Discard the content - it's never stored!
-        self.store.set(doc_id, content, title, url, embedding_callback)
+        self.store.set(doc_id, content, title, url, summary, embedding_callback)
     
     def add_document_with_vector(
         self,
         doc_id: str,
         vector: List[float],
         title: str = "",
-        url: str = ""
+        url: str = "",
+        summary: str = ""
     ) -> None:
         """
         Add a document with a pre-computed vector.
@@ -101,8 +104,9 @@ class VectorStoreWrapper:
             vector: Pre-computed embedding vector
             title: Document title (optional)
             url: Document URL (optional)
+            summary: Document summary (optional)
         """
-        self.store.set_vector(doc_id, vector, title, url)
+        self.store.set_vector(doc_id, vector, title, url, summary if summary else None)
     
     def add_documents(self, documents: List[Dict[str, str]]) -> None:
         """
@@ -127,8 +131,9 @@ class VectorStoreWrapper:
             
             title = doc.get('title', '')
             url = doc.get('url', '')
+            summary = doc.get('summary', '')
             
-            self.add_document(doc_id, content, title, url)
+            self.add_document(doc_id, content, title, url, summary)
             # At this point, content has been vectorized and discarded!
     
     def search(
@@ -144,7 +149,7 @@ class VectorStoreWrapper:
             k: Number of results to return
             
         Returns:
-            List of result dictionaries with keys: id, score, title, url
+            List of result dictionaries with keys: id, score, title, url, summary
             Note: 'content' is NOT included since we don't store it!
         """
         # Generate embedding for query
@@ -193,7 +198,7 @@ class VectorStoreWrapper:
             doc_id: Document ID
             
         Returns:
-            Dictionary with title and url (no content!)
+            Dictionary with title, url, and summary (no content!)
         """
         return self.store.get_metadata(doc_id)
     

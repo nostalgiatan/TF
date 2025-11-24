@@ -3,18 +3,20 @@ use pyo3::types::{PyDict, PyList};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use vecstore::{Metadata, Query, VecStore};
 
 /// Vector store that manages embeddings and metadata using VecStore
 /// 
-/// This implementation is optimized for memory efficiency:
-/// - Only stores vectors and metadata (title, url)
+/// This implementation is optimized for memory efficiency and performance:
+/// - Only stores vectors and metadata (title, url, summary)
 /// - Does NOT store content text - it's discarded after vectorization
 /// - Uses Python callback to convert content to vectors on-the-fly
+/// - Thread-safe with RwLock for concurrent read access
+/// - No unsafe blocks - all operations are memory-safe
 #[pyclass]
 struct VectorStore {
-    store: Arc<Mutex<VecStore>>,
+    store: Arc<RwLock<VecStore>>,
     dimension: usize,
     temp_path: Option<PathBuf>,
 }
@@ -44,7 +46,7 @@ impl VectorStore {
         })?;
 
         Ok(VectorStore {
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(RwLock::new(store)),
             dimension,
             temp_path: Some(temp_dir),
         })
@@ -55,7 +57,7 @@ impl VectorStore {
     /// This is a memory-efficient method that:
     /// 1. Calls the Python callback function with the content
     /// 2. Gets the vector from the callback
-    /// 3. Stores only the vector and metadata (title, url)
+    /// 3. Stores only the vector and metadata (title, url, summary)
     /// 4. Discards the content after vectorization
     /// 
     /// Args:
@@ -63,6 +65,7 @@ impl VectorStore {
     ///     content: Document content (will be vectorized via callback then discarded)
     ///     title: Document title (stored)
     ///     url: Document URL (stored)
+    ///     summary: Document summary (stored, optional)
     ///     embedding_callback: Python callable that takes content and returns vector
     fn set(
         &mut self,
@@ -71,10 +74,11 @@ impl VectorStore {
         content: String,
         title: String,
         url: String,
+        summary: String,
         embedding_callback: Py<PyAny>,
     ) -> PyResult<()> {
         // Call Python callback to get embedding vector
-        let vector: Vec<f32> = embedding_callback.call1(py, (content.clone(),))?.extract(py)?;
+        let vector: Vec<f32> = embedding_callback.call1(py, (content,))?.extract(py)?;
 
         // Validate vector dimension
         if vector.len() != self.dimension {
@@ -85,19 +89,20 @@ impl VectorStore {
             )));
         }
 
-        // Create metadata - only store title and url, NOT content
+        // Create metadata - store title, url, and summary, NOT content
         // This is the key to memory efficiency!
         let mut metadata = Metadata {
             fields: HashMap::new(),
         };
         metadata.fields.insert("title".to_string(), json!(title));
         metadata.fields.insert("url".to_string(), json!(url));
+        metadata.fields.insert("summary".to_string(), json!(summary));
 
         // Upsert vector with metadata
         // After this point, content is dropped and memory is freed
         self.store
-            .lock()
-            .unwrap()
+            .write()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock error: {}", e)))?
             .upsert(id, vector, metadata)
             .map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -118,12 +123,14 @@ impl VectorStore {
     ///     vector: Pre-computed embedding vector
     ///     title: Document title
     ///     url: Document URL
+    ///     summary: Document summary (optional)
     fn set_vector(
         &mut self,
         id: String,
         vector: Vec<f32>,
         title: String,
         url: String,
+        summary: Option<String>,
     ) -> PyResult<()> {
         if vector.len() != self.dimension {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
@@ -133,16 +140,19 @@ impl VectorStore {
             )));
         }
 
-        // Create metadata - only title and url, no content
+        // Create metadata - title, url, and summary, no content
         let mut metadata = Metadata {
             fields: HashMap::new(),
         };
         metadata.fields.insert("title".to_string(), json!(title));
         metadata.fields.insert("url".to_string(), json!(url));
+        if let Some(sum) = summary {
+            metadata.fields.insert("summary".to_string(), json!(sum));
+        }
 
         self.store
-            .lock()
-            .unwrap()
+            .write()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock error: {}", e)))?
             .upsert(id, vector, metadata)
             .map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -161,7 +171,7 @@ impl VectorStore {
     ///     k: Number of results to return (default: 5)
     ///
     /// Returns:
-    ///     List of dictionaries containing id, score, title, and url
+    ///     List of dictionaries containing id, score, title, url, and summary
     ///     Note: Does NOT include content since we don't store it
     fn search(&self, py: Python, vector: Vec<f32>, k: Option<usize>) -> PyResult<Py<PyList>> {
         if vector.len() != self.dimension {
@@ -181,10 +191,13 @@ impl VectorStore {
             filter: None,
         };
 
-        // Execute query
-        let results = self.store.lock().unwrap().query(query).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Search failed: {}", e))
-        })?;
+        // Execute query with read lock for concurrent access
+        let results = self.store.read()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock error: {}", e)))?
+            .query(query)
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Search failed: {}", e))
+            })?;
 
         // Convert results to Python list
         let result_list = PyList::empty(py);
@@ -194,7 +207,7 @@ impl VectorStore {
             dict.set_item("id", &result.id)?;
             dict.set_item("score", result.score)?;
 
-            // Extract metadata fields (title, url only - no content)
+            // Extract metadata fields (title, url, summary - no content)
             if let Some(title) = result.metadata.fields.get("title") {
                 if let Some(title_str) = title.as_str() {
                     dict.set_item("title", title_str)?;
@@ -205,6 +218,11 @@ impl VectorStore {
                     dict.set_item("url", url_str)?;
                 }
             }
+            if let Some(summary) = result.metadata.fields.get("summary") {
+                if let Some(summary_str) = summary.as_str() {
+                    dict.set_item("summary", summary_str)?;
+                }
+            }
 
             result_list.append(dict)?;
         }
@@ -212,40 +230,88 @@ impl VectorStore {
         Ok(result_list.into())
     }
 
-    /// Remove a vector and its metadata
+    /// Remove a vector and its metadata (Delete operation)
     ///
     /// Args:
     ///     id: Unique identifier of the document to remove
     fn rm(&mut self, id: String) -> PyResult<()> {
-        self.store.lock().unwrap().delete(&id).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to remove vector: {}",
-                e
-            ))
-        })?;
+        self.store.write()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock error: {}", e)))?
+            .delete(&id)
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Failed to remove vector: {}",
+                    e
+                ))
+            })?;
 
         Ok(())
     }
 
+    /// Update metadata for an existing document
+    ///
+    /// Args:
+    ///     id: Document identifier
+    ///     title: New title (optional)
+    ///     url: New URL (optional)
+    ///     summary: New summary (optional)
+    fn update(&mut self, id: String, title: Option<String>, url: Option<String>, summary: Option<String>) -> PyResult<()> {
+        let mut store = self.store.write()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock error: {}", e)))?;
+        
+        let all_records = store.list_active();
+        
+        // Find the record
+        for record in all_records {
+            if record.id == id {
+                let mut metadata = record.metadata.clone();
+                
+                // Update fields if provided
+                if let Some(t) = title {
+                    metadata.fields.insert("title".to_string(), json!(t));
+                }
+                if let Some(u) = url {
+                    metadata.fields.insert("url".to_string(), json!(u));
+                }
+                if let Some(s) = summary {
+                    metadata.fields.insert("summary".to_string(), json!(s));
+                }
+                
+                // Update in store
+                store.update_metadata(&id, metadata)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to update: {}", e)))?;
+                
+                return Ok(());
+            }
+        }
+        
+        Err(PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!("Document not found: {}", id)))
+    }
+
     /// Get the number of vectors in the store
     fn len(&self) -> PyResult<usize> {
-        Ok(self.store.lock().unwrap().len())
+        Ok(self.store.read()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock error: {}", e)))?
+            .len())
     }
 
     /// Check if the store is empty
     fn is_empty(&self) -> PyResult<bool> {
-        Ok(self.store.lock().unwrap().is_empty())
+        Ok(self.store.read()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock error: {}", e)))?
+            .is_empty())
     }
 
-    /// Get metadata for a specific document
+    /// Get metadata for a specific document (Read operation)
     ///
     /// Args:
     ///     id: Document identifier
     ///
     /// Returns:
-    ///     Dictionary containing title and url (no content)
-    fn get_metadata(&self, py: Python, id: String) -> PyResult<Py<PyAny>> {
-        let store = self.store.lock().unwrap();
+    ///     Dictionary containing title, url, and summary (no content)
+    fn get(&self, py: Python, id: String) -> PyResult<Py<PyAny>> {
+        let store = self.store.read()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Lock error: {}", e)))?;
         let all_records = store.list_active();
 
         // Find the record with matching id
@@ -263,12 +329,22 @@ impl VectorStore {
                         dict.set_item("url", url_str)?;
                     }
                 }
+                if let Some(summary) = record.metadata.fields.get("summary") {
+                    if let Some(summary_str) = summary.as_str() {
+                        dict.set_item("summary", summary_str)?;
+                    }
+                }
 
                 return Ok(dict.into());
             }
         }
 
         Ok(py.None())
+    }
+    
+    /// Alias for get() to maintain backward compatibility
+    fn get_metadata(&self, py: Python, id: String) -> PyResult<Py<PyAny>> {
+        self.get(py, id)
     }
 }
 

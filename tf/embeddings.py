@@ -39,7 +39,7 @@ class TextEmbedder:
         self.dimension = self.model.config.hidden_size
         print(f"Model loaded. Embedding dimension: {self.dimension}")
     
-    def encode(self, texts: Union[str, List[str]], batch_size: int = 32) -> List[List[float]]:
+    def encode(self, texts: Union[str, List[str]], batch_size: int = 32) -> Union[List[float], List[List[float]]]:
         """
         Encode text(s) into vector embeddings.
         
@@ -48,7 +48,8 @@ class TextEmbedder:
             batch_size: Batch size for processing multiple texts
             
         Returns:
-            List of embeddings (each embedding is a list of floats)
+            Single embedding (List[float]) if input is a string,
+            or list of embeddings (List[List[float]]) if input is a list
         """
         # Handle single text input
         if isinstance(texts, str):

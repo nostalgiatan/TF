@@ -73,7 +73,7 @@ class VectorStoreWrapper:
             """Callback that Rust calls to get the embedding vector."""
             embedding = self.embedder.encode(text)
             # Ensure embedding is a flat list of floats
-            if isinstance(embedding[0], list):
+            if isinstance(embedding, list) and len(embedding) > 0 and isinstance(embedding[0], list):
                 embedding = embedding[0]
             return embedding
         
@@ -151,7 +151,7 @@ class VectorStoreWrapper:
         query_embedding = self.embedder.encode(query)
         
         # Ensure embedding is a flat list of floats
-        if isinstance(query_embedding[0], list):
+        if isinstance(query_embedding, list) and len(query_embedding) > 0 and isinstance(query_embedding[0], list):
             query_embedding = query_embedding[0]
         
         # Search in Rust store

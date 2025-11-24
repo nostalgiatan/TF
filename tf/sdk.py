@@ -130,10 +130,16 @@ class DocumentStore:
             # Parallel processing with thread pool
             futures = []
             for doc in documents:
+                doc_id = doc.get('id')
+                content = doc.get('content')
+                
+                if not doc_id or not content:
+                    raise ValueError(f"Document missing required fields 'id' and/or 'content': {doc}")
+                
                 future = self._executor.submit(
                     self.add,
-                    doc.get('id'),
-                    doc.get('content'),
+                    doc_id,
+                    content,
                     doc.get('title', ''),
                     doc.get('url', ''),
                     doc.get('summary', '')
@@ -146,9 +152,15 @@ class DocumentStore:
         else:
             # Sequential processing
             for doc in documents:
+                doc_id = doc.get('id')
+                content = doc.get('content')
+                
+                if not doc_id or not content:
+                    raise ValueError(f"Document missing required fields 'id' and/or 'content': {doc}")
+                
                 self.add(
-                    doc.get('id'),
-                    doc.get('content'),
+                    doc_id,
+                    content,
                     doc.get('title', ''),
                     doc.get('url', ''),
                     doc.get('summary', '')

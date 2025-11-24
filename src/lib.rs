@@ -7,6 +7,11 @@ use std::sync::{Arc, Mutex};
 use vecstore::{Metadata, Query, VecStore};
 
 /// Vector store that manages embeddings and metadata using VecStore
+/// 
+/// This implementation is optimized for memory efficiency:
+/// - Only stores vectors and metadata (title, url)
+/// - Does NOT store content text - it's discarded after vectorization
+/// - Uses Python callback to convert content to vectors on-the-fly
 #[pyclass]
 struct VectorStore {
     store: Arc<Mutex<VecStore>>,
@@ -17,6 +22,9 @@ struct VectorStore {
 #[pymethods]
 impl VectorStore {
     /// Create a new VectorStore instance
+    /// 
+    /// Args:
+    ///     dimension: Vector dimension (e.g., 768 for most embedding models)
     #[new]
     fn new(dimension: usize) -> PyResult<Self> {
         // Create a temporary directory for the vector store
@@ -42,21 +50,80 @@ impl VectorStore {
         })
     }
 
-    /// Set (add/update) a vector with its metadata
-    ///
+    /// Set (add/update) a document using Python callback for vectorization
+    /// 
+    /// This is a memory-efficient method that:
+    /// 1. Calls the Python callback function with the content
+    /// 2. Gets the vector from the callback
+    /// 3. Stores only the vector and metadata (title, url)
+    /// 4. Discards the content after vectorization
+    /// 
     /// Args:
     ///     id: Unique identifier for the document
-    ///     vector: List of floats representing the embedding
+    ///     content: Document content (will be vectorized via callback then discarded)
+    ///     title: Document title (stored)
+    ///     url: Document URL (stored)
+    ///     embedding_callback: Python callable that takes content and returns vector
+    fn set(
+        &mut self,
+        py: Python,
+        id: String,
+        content: String,
+        title: String,
+        url: String,
+        embedding_callback: Py<PyAny>,
+    ) -> PyResult<()> {
+        // Call Python callback to get embedding vector
+        let vector: Vec<f32> = embedding_callback.call1(py, (content.clone(),))?.extract(py)?;
+
+        // Validate vector dimension
+        if vector.len() != self.dimension {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Vector dimension mismatch. Expected {}, got {}",
+                self.dimension,
+                vector.len()
+            )));
+        }
+
+        // Create metadata - only store title and url, NOT content
+        // This is the key to memory efficiency!
+        let mut metadata = Metadata {
+            fields: HashMap::new(),
+        };
+        metadata.fields.insert("title".to_string(), json!(title));
+        metadata.fields.insert("url".to_string(), json!(url));
+
+        // Upsert vector with metadata
+        // After this point, content is dropped and memory is freed
+        self.store
+            .lock()
+            .unwrap()
+            .upsert(id, vector, metadata)
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Failed to add vector: {}",
+                    e
+                ))
+            })?;
+
+        Ok(())
+    }
+
+    /// Set a document with pre-computed vector (for batch operations)
+    /// 
+    /// Use this when you already have the vector and don't need the callback.
+    /// 
+    /// Args:
+    ///     id: Unique identifier for the document
+    ///     vector: Pre-computed embedding vector
     ///     title: Document title
     ///     url: Document URL
-    ///     content: Document content
-    fn set(
+    fn set_vector(
         &mut self,
         id: String,
         vector: Vec<f32>,
         title: String,
         url: String,
-        content: String,
     ) -> PyResult<()> {
         if vector.len() != self.dimension {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
@@ -66,17 +133,13 @@ impl VectorStore {
             )));
         }
 
-        // Create metadata
+        // Create metadata - only title and url, no content
         let mut metadata = Metadata {
             fields: HashMap::new(),
         };
         metadata.fields.insert("title".to_string(), json!(title));
         metadata.fields.insert("url".to_string(), json!(url));
-        metadata
-            .fields
-            .insert("content".to_string(), json!(content));
 
-        // Upsert vector with metadata
         self.store
             .lock()
             .unwrap()
@@ -98,7 +161,8 @@ impl VectorStore {
     ///     k: Number of results to return (default: 5)
     ///
     /// Returns:
-    ///     List of dictionaries containing id, score, title, url, and content
+    ///     List of dictionaries containing id, score, title, and url
+    ///     Note: Does NOT include content since we don't store it
     fn search(&self, py: Python, vector: Vec<f32>, k: Option<usize>) -> PyResult<Py<PyList>> {
         if vector.len() != self.dimension {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
@@ -130,7 +194,7 @@ impl VectorStore {
             dict.set_item("id", &result.id)?;
             dict.set_item("score", result.score)?;
 
-            // Extract metadata fields
+            // Extract metadata fields (title, url only - no content)
             if let Some(title) = result.metadata.fields.get("title") {
                 if let Some(title_str) = title.as_str() {
                     dict.set_item("title", title_str)?;
@@ -139,11 +203,6 @@ impl VectorStore {
             if let Some(url) = result.metadata.fields.get("url") {
                 if let Some(url_str) = url.as_str() {
                     dict.set_item("url", url_str)?;
-                }
-            }
-            if let Some(content) = result.metadata.fields.get("content") {
-                if let Some(content_str) = content.as_str() {
-                    dict.set_item("content", content_str)?;
                 }
             }
 
@@ -184,7 +243,7 @@ impl VectorStore {
     ///     id: Document identifier
     ///
     /// Returns:
-    ///     Dictionary containing title, url, and content, or None if not found
+    ///     Dictionary containing title and url (no content)
     fn get_metadata(&self, py: Python, id: String) -> PyResult<Py<PyAny>> {
         let store = self.store.lock().unwrap();
         let all_records = store.list_active();
@@ -202,11 +261,6 @@ impl VectorStore {
                 if let Some(url) = record.metadata.fields.get("url") {
                     if let Some(url_str) = url.as_str() {
                         dict.set_item("url", url_str)?;
-                    }
-                }
-                if let Some(content) = record.metadata.fields.get("content") {
-                    if let Some(content_str) = content.as_str() {
-                        dict.set_item("content", content_str)?;
                     }
                 }
 

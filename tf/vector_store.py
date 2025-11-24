@@ -1,8 +1,14 @@
 """
 Vector store wrapper that integrates Python embeddings with Rust vector storage.
+
+MEMORY EFFICIENT DESIGN:
+- Content is NOT stored in the vector database
+- Only vectors and metadata (title, url) are stored
+- Content is discarded immediately after vectorization
+- This minimizes memory usage and maximizes performance
 """
 
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Callable
 from .embeddings import TextEmbedder
 
 
@@ -10,8 +16,10 @@ class VectorStoreWrapper:
     """
     High-level wrapper that combines TextEmbedder with the Rust VectorStore.
     
-    This class provides a convenient interface for adding documents,
+    This class provides a memory-efficient interface for adding documents,
     searching by text, and managing the vector database.
+    
+    KEY FEATURE: Content is NOT stored - only vectors and metadata!
     """
     
     def __init__(self, embedder: TextEmbedder = None, rust_store=None):
@@ -51,35 +59,64 @@ class VectorStoreWrapper:
         """
         Add a document to the vector store.
         
-        The content will be automatically converted to a vector embedding.
+        MEMORY EFFICIENT: The content is vectorized and then immediately discarded.
+        Only the vector and metadata (title, url) are stored.
         
         Args:
             doc_id: Unique identifier for the document
-            content: Document content (will be embedded)
+            content: Document content (will be vectorized then discarded)
+            title: Document title (optional, will be stored)
+            url: Document URL (optional, will be stored)
+        """
+        # Create callback function for Rust to call
+        def embedding_callback(text: str) -> List[float]:
+            """Callback that Rust calls to get the embedding vector."""
+            embedding = self.embedder.encode(text)
+            # Ensure embedding is a flat list of floats
+            if isinstance(embedding[0], list):
+                embedding = embedding[0]
+            return embedding
+        
+        # Call Rust's set method with the callback
+        # Rust will:
+        # 1. Call embedding_callback(content) to get the vector
+        # 2. Store the vector with metadata (title, url)
+        # 3. Discard the content - it's never stored!
+        self.store.set(doc_id, content, title, url, embedding_callback)
+    
+    def add_document_with_vector(
+        self,
+        doc_id: str,
+        vector: List[float],
+        title: str = "",
+        url: str = ""
+    ) -> None:
+        """
+        Add a document with a pre-computed vector.
+        
+        Use this when you already have the vector and want to avoid re-computing it.
+        
+        Args:
+            doc_id: Unique identifier for the document
+            vector: Pre-computed embedding vector
             title: Document title (optional)
             url: Document URL (optional)
         """
-        # Generate embedding for content
-        embedding = self.embedder.encode(content)
-        
-        # Ensure embedding is a flat list of floats
-        if isinstance(embedding[0], list):
-            # If encode returned a list of embeddings, take the first one
-            embedding = embedding[0]
-        
-        # Add to Rust store
-        self.store.set(doc_id, embedding, title, url, content)
+        self.store.set_vector(doc_id, vector, title, url)
     
     def add_documents(self, documents: List[Dict[str, str]]) -> None:
         """
         Add multiple documents at once.
         
+        MEMORY EFFICIENT: Each document's content is vectorized and discarded
+        before processing the next one.
+        
         Args:
             documents: List of document dictionaries with keys:
                       - id: Document ID (required)
-                      - content: Document content (required)
-                      - title: Document title (optional)
-                      - url: Document URL (optional)
+                      - content: Document content (required, will be discarded)
+                      - title: Document title (optional, will be stored)
+                      - url: Document URL (optional, will be stored)
         """
         for doc in documents:
             doc_id = doc.get('id')
@@ -92,6 +129,7 @@ class VectorStoreWrapper:
             url = doc.get('url', '')
             
             self.add_document(doc_id, content, title, url)
+            # At this point, content has been vectorized and discarded!
     
     def search(
         self,
@@ -106,7 +144,8 @@ class VectorStoreWrapper:
             k: Number of results to return
             
         Returns:
-            List of result dictionaries with keys: id, score, title, url, content
+            List of result dictionaries with keys: id, score, title, url
+            Note: 'content' is NOT included since we don't store it!
         """
         # Generate embedding for query
         query_embedding = self.embedder.encode(query)
@@ -133,7 +172,7 @@ class VectorStoreWrapper:
             k: Number of results to return
             
         Returns:
-            List of result dictionaries with keys: id, score, title, url, content
+            List of result dictionaries with keys: id, score, title, url
         """
         return self.store.search(embedding, k)
     
@@ -154,7 +193,7 @@ class VectorStoreWrapper:
             doc_id: Document ID
             
         Returns:
-            Dictionary with title, url, and content, or None if not found
+            Dictionary with title and url (no content!)
         """
         return self.store.get_metadata(doc_id)
     
@@ -165,3 +204,4 @@ class VectorStoreWrapper:
     def is_empty(self) -> bool:
         """Check if the store is empty."""
         return self.store.is_empty()
+
